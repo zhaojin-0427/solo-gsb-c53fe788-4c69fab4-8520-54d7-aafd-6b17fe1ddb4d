@@ -13,6 +13,7 @@
 - `If-Range`（ETag 强比较或 HTTP 日期）失配时忽略 Range，返回完整实体（200）。
 - 每次响应绑定同一修订：流式传输期间事务与行锁保持打开，此时发布新版本**不会混入**内容或元数据。
 - **可恢复复制会话**：`POST /copy-sessions` 在同一数据库快照中锁定源路径集合与全部目标路径，生成按稳定路径与修订序排列、带 SHA-256 内容摘要的清单，并为每个目标路径（含目标尚不存在的状态）保存**修订身份基线**；客户端按游标逐段拉取内容（重复拉取字节、摘要、游标完全一致，即使源对象随后发布新修订），逐段确认时服务锁定目标并与基线比较修订身份——**建档后目标路径的任何发布（哪怕字节与待复制内容完全相同）都判为冲突**，返回 `409`、冲突对象与恢复位置，整批不应用、不推进游标；基线未变时维持原子应用与会话前同内容目标的幂等跳过，重复确认或重放返回同一批次结果。
+- **历史修订回收**：`POST /gc` 提交 1～100 个对象路径（服务去重）、UTC 截止时间 `before` 与布尔 `dry_run`；只考虑创建时间**严格早于** `before` 的修订，且**当前修订、复制会话清单或目标基线引用的修订一律保留**。`dry_run`（缺省 `true`）在可重复读快照中按路径排序返回候选修订号、可释放字节数与被保留修订的原因，不改数据；`dry_run=false` 按固定路径升序锁定全部对象行，在**同一事务内重新判定并删除**，整批成功或回滚——与 PUT、复制会话建档/确认、流式 GET 并发时不会误删在用修订或留下悬空引用；重复执行返回空清单，后续发布的修订号仍递增。
 
 ## 快速启动（Docker Compose）
 
@@ -39,6 +40,7 @@ curl http://localhost:8000/healthz
 | `GET` | `/copy-sessions/{id}` | 会话状态：清单摘要、分段进度、恢复位置 |
 | `GET` | `/copy-sessions/{id}/segments?cursor=` | 拉取游标之后的内容分段（无 `cursor` 参数时返回首段）；重复拉取字节、摘要、游标完全一致 |
 | `POST` | `/copy-sessions/{id}/acks` | 按游标确认分段：锁定目标并与建档修订基线比较身份，原子批次应用；建档后任何发布（含同字节重发）返回 `409`，整批不应用、不推进游标；重复确认 / 重放返回同一批次结果 |
+| `POST` | `/gc` | 历史修订回收：提交 `paths`（1～100，去重）、UTC 截止时间 `before` 与 `dry_run`；预览返回候选修订号、可释放字节数与保留原因，执行在同一事务内重判定并删除（整批成功或回滚）；路径不存在整次 `404` |
 | `GET` | `/healthz` | 健康检查 |
 
 支持的条件头：`If-Match`、`If-None-Match`、`If-Modified-Since`、`If-Unmodified-Since`（PUT/GET/HEAD 均按 §13.2.2 顺序求值）。
@@ -243,6 +245,91 @@ curl -s -X POST http://localhost:8000/copy-sessions -H 'Content-Type: applicatio
        "cursor": "<last_confirmed_cursor>"}' | python3 -m json.tool
 ```
 
+## 历史修订回收（POST /gc）
+
+对象每发布一次就新增一个修订，历史修订会一直占用存储。`POST /gc` 回收**不再被任何地方引用**的历史修订：
+
+- 请求体：`paths`（1～100 个对象路径，服务去重）、`before`（ISO 8601 时间戳，无时区按 UTC 解释）、`dry_run`（布尔，缺省 `true`）。
+- 只有创建时间**严格早于** `before` 的修订才会进入回收视野（出现在 `candidates` / `retained` 中）。
+- **一律保留**：对象的当前修订、任何复制会话清单（`copy_manifest`）引用的修订、任何目标基线（`target_baseline`）引用的修订——因此回收永远不会让进行中的复制会话或流式 GET 读到悬空引用。
+- 任一路径不存在（含只有空占位行的路径）时**整次返回 404**，不回收任何对象。
+- `dry_run=true`：在可重复读快照中按路径排序返回候选修订号、每路径与总的可释放字节数、被保留修订的原因，**不改动任何数据**。
+- `dry_run=false`：按固定路径升序以 `FOR UPDATE` 锁定全部对象行（与发布、建档、确认相同的全局锁序），在锁内**重新判定**候选并删除，同一事务提交——任何失败整批回滚，不留部分回收。并发 PUT / 建档 / 确认 / 流式 GET 要么已提交（被锁内重判定看到），要么等待本事务提交，因此在用修订不会被误删。
+- 重复执行返回空清单；当前修订（永远是最大修订号）不会被删除，后续发布继续 `max + 1` 递增，**不会复用已回收的修订号**。
+
+```bash
+# 1. 准备：发布三个修订（rev 1/2 是历史修订，rev 3 为当前修订）
+curl -s -X PUT --data-binary 'v1-aaaa' http://localhost:8000/objects/doc.txt
+curl -s -X PUT --data-binary 'v2-bb'    http://localhost:8000/objects/doc.txt
+curl -s -X PUT --data-binary 'v3-c'     http://localhost:8000/objects/doc.txt
+
+# 2. 预览（dry_run 缺省即 true）：不改动任何数据
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths": ["doc.txt"], "before": "2099-01-01T00:00:00Z", "dry_run": true}' \
+  | python3 -m json.tool
+# {
+#   "dry_run": true,
+#   "before": "2099-01-01T00:00:00+00:00",
+#   "objects": [
+#     {
+#       "path": "doc.txt",
+#       "candidates": [
+#         {"revision_no": 1, "bytes": 7},
+#         {"revision_no": 2, "bytes": 5}
+#       ],
+#       "releasable_bytes": 12,
+#       "retained": [{"revision_no": 3, "reasons": ["current"]}]
+#     }
+#   ],
+#   "total_releasable_bytes": 12
+# }
+
+# 3. 执行：同一事务内重新判定并删除，整批成功或回滚
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths": ["doc.txt"], "before": "2099-01-01T00:00:00Z", "dry_run": false}' \
+  | python3 -m json.tool
+# {
+#   "dry_run": false,
+#   "before": "2099-01-01T00:00:00+00:00",
+#   "deleted": [
+#     {"path": "doc.txt", "revision_no": 1, "bytes": 7},
+#     {"path": "doc.txt", "revision_no": 2, "bytes": 5}
+#   ],
+#   "deleted_count": 2,
+#   "deleted_bytes": 12
+# }
+
+# 4. 重复执行返回空清单；当前修订不受影响；修订号继续递增
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths": ["doc.txt"], "before": "2099-01-01T00:00:00Z", "dry_run": false}'
+# {"dry_run":false,"before":"2099-01-01T00:00:00+00:00","deleted":[],"deleted_count":0,"deleted_bytes":0}
+curl -s http://localhost:8000/objects/doc.txt          # v3-c
+curl -si -X PUT --data-binary 'v4' http://localhost:8000/objects/doc.txt | grep -i x-revision-no
+# X-Revision-No: 4        <- 不复用已回收的 1/2
+
+# 5. 被复制会话引用的修订一律保留：先建档（清单钉住 rev 1），再发布 rev 2
+curl -s -X PUT --data-binary 'alpha' http://localhost:8000/objects/src/a.txt
+SID=$(curl -s -X POST http://localhost:8000/copy-sessions -H 'Content-Type: application/json' \
+  -d '{"source_paths": ["src/a.txt"], "target_prefix": "backup/"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["session"])')
+curl -s -X PUT --data-binary 'alpha-v2' http://localhost:8000/objects/src/a.txt
+
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths": ["src/a.txt"], "before": "2099-01-01T00:00:00Z", "dry_run": true}' \
+  | python3 -m json.tool
+# "retained": [
+#   {"revision_no": 1, "reasons": ["copy_manifest"]},   <- 清单钉住，不回收
+#   {"revision_no": 2, "reasons": ["current"]}
+# ]
+# 执行也不会删除它们；会话分段拉取仍返回 alpha 快照字节
+curl -s "http://localhost:8000/copy-sessions/$SID/segments" | python3 -m json.tool
+
+# 6. 路径不存在：整次 404，不回收任何对象
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths": ["doc.txt", "nope.txt"], "before": "2099-01-01T00:00:00Z"}'
+# 404 {"detail":"object_not_found","missing":["nope.txt"]}
+```
+
 ## 本地开发
 
 ```bash
@@ -262,6 +349,7 @@ python -m pytest
 - `tests/test_copy_cursor.py`：复制游标与清单摘要的纯逻辑单元测试（编解码往返、防篡改、确定性）。
 - `tests/test_integration.py`：真实 PostgreSQL + 完整 HTTP 服务的端到端测试，覆盖 200/204/206/304/404/412/416、多段 multipart 确定性、`If-Range`、并发"仅创建"只有一个成功、以及流式传输期间发布新版本不混入内容。
 - `tests/test_copy_sessions.py`：复制会话端到端测试，覆盖清单顺序与摘要、分段重复拉取字节一致、源对象发布新修订后仍返回快照内容、原子应用、冲突整批回滚与结构化结果、**建档后同字节重新发布仍判冲突（含已存在目标的同内容新修订、整批回滚、新会话恢复）**、升级前无基线会话返回 `baseline_missing` 不按摘要放行、重放返回同一批次结果、乱序/伪造游标拒绝、跨会话断点续传与冲突恢复、并发确认收敛，以及**确认与目标首次发布在空占位行上的交错：DB 层确定性复现两种先后顺序（PUT 先 -> 409 非 500、修订号不重复；确认先 -> PUT 等待并接续修订号）+ HTTP 屏障压测两者皆不出现 500/重复修订号**。
+- `tests/test_gc.py`：历史修订回收端到端测试，覆盖请求校验（路径数 1～100、`before`、`dry_run`）、路径不存在整次 404 且执行路径不删任何修订（整批回滚）、空占位行视为不存在、预览分类与零副作用、截止时间的严格小于语义、路径去重与排序、执行后重放返回空清单、修订号不复用继续递增、清单/基线引用保留与原因合并、混合对象只回收未钉住修订且确认仍可应用，以及并发安全：**流式 GET 期间回收等待且不误删在读修订**、回收与 PUT 交错不删新修订且编号连续、回收与确认交错清单钉住的修订必存活、两个并发执行在锁内重判定收敛（每个修订只删一次）。
 
 ## 设计要点
 
@@ -270,8 +358,9 @@ python -m pytest
 - **空占位行竞态**：建档为不存在的目标留下 `current_id` NULL 的占位行。确认若像旧实现那样"INNER JOIN `revisions` 后对对象加 `FOR UPDATE`"，空占位行会被连接过滤、一行都锁不住：与该路径首个 PUT 交错时双方可能各插修订号 1（唯一约束冲突导致确认 **500**）。修复把**取锁**与**读修订**拆成两条语句——先按路径升序纯 `FOR UPDATE` 锁住包括空占位在内的全部目标行，随后的连接读取不会阻塞、也不会在批次执行期间变陈旧；PUT 侧同样先锁行再读。于是：PUT 先提交时确认等待后看到新修订并报 `409`（冲突对象 + 恢复位置，整批回滚、游标不前进）；确认先持锁时 PUT 等待，确认提交修订 1 后 PUT 以 `max+1` 接续修订 2，双方不死锁。
 - **流式隔离**：响应体由 `StreamingResponse` 从被锁定的修订分块读出（`substring(content ...)`），事务在最后一个字节发送后才提交，新修订的发布会等待锁释放，故响应内容、ETag、`Content-Range` 始终属于同一修订。
 - **确定性 multipart**：边界 = `SHA-256(ETag | media-type | 升序合并后的区间)`，不含任何随机因素。
-- **复制会话快照**：`copy_sessions` + `copy_session_entries` 在创建事务内先对源集与全部目标路径（先 `INSERT ... ON CONFLICT DO NOTHING` 补齐占位行）按全局路径升序 `FOR SHARE` 锁定，再在锁内读取源修订；清单钉住 `revision_id`（修订行永不更新/删除），因此分段内容在会话生命周期内不可变。
+- **复制会话快照**：`copy_sessions` + `copy_session_entries` 在创建事务内先对源集与全部目标路径（先 `INSERT ... ON CONFLICT DO NOTHING` 补齐占位行）按全局路径升序 `FOR SHARE` 锁定，再在锁内读取源修订；清单钉住 `revision_id`（修订行永不更新；`/gc` 回收保留一切被清单/基线引用的修订），因此分段内容在会话生命周期内不可变。
 - **目标修订基线**：建档时在同一锁快照中把每个目标路径的当前修订身份写入 `copy_session_target_baselines`，目标不存在记 NULL。确认时以修订 `id`（而非摘要）判定是否变更：摘要相同只能证明字节相同，不能区分"自基线未改动"与"基线后又发布了同字节修订"，后者必须报冲突。占位行保证"目标不存在"这一基线也被行锁覆盖，并发首发布会阻塞到建档事务提交。
 - **确定性游标**：游标 = HMAC-SHA-256 签名的 `(会话, 段号, 清单摘要, 段末路径, 目标前缀, 源集摘要)`，是同一会话状态的纯函数——重发必相同、跨会话/跨清单必失效（`cursor_expired`）；签名密钥存于 `service_meta` 表，重启后游标仍有效。
 - **原子批次确认**：确认在单事务内先用一条纯 `FOR UPDATE`（不连接 `revisions`）按目标路径升序锁定本批**全部** `objects` 行——建档留下的空占位行也在内——再用第二条语句读取当前修订（与建档的 `FOR SHARE`、并发发布及其它会话使用同一全局锁序，无死锁地串行化），逐目标与基线比较修订身份：基线不存在且仍不存在则创建、身份未变且摘要相同则幂等跳过、身份变化（含同字节重发，`reason=target_republished_same_content`）或摘要分歧（`content_diverged`）记为冲突；整批应用 + ack 记录 + 进度推进同事务提交，冲突则整批回滚后单独落库冲突结果。批次结果以**文本**形式存储（保持原始键序），重放与首次响应字节一致；`INSERT ... ON CONFLICT DO NOTHING` 使并发确认收敛到同一条结果。
 - **升级兼容**：表结构由启动时的 `CREATE TABLE IF NOT EXISTS` 自动补齐，旧库重启即有基线表；升级前创建的未完成会话没有基线行，确认未完成段时返回 `409 baseline_missing` 且不推进游标（绝不按摘要放行），重新创建会话取得新基线后继续；已经持久化的历史确认结果仍优先重放，不受影响。
+- **历史修订回收**：`POST /gc` 的执行路径在单事务内先用一条按路径升序的纯 `FOR UPDATE`（不连接 `revisions`、不补占位行）锁定全部请求对象行——与发布、建档（`FOR SHARE`）、确认共用同一全局锁序，彼此串行化而不死锁——再在锁内重新分类：只考虑 `created_at` 严格早于 `before` 的修订，且当前修订、被任何清单或基线引用的修订一律保留，其余同事务删除，任何失败整批回滚。因为重判定发生在锁内，并发 PUT、建档、确认或流式 GET 要么已提交（其结果对分类可见）、要么阻塞到回收提交，所以在用修订不会被误删、外键（`objects.current_id`、清单、基线）不会悬空。当前修订永远是最大修订号且必被保留，`max(revision_no) + 1` 的编号在回收后仍严格递增、不复用旧号。预览（`dry_run`）则在 `REPEATABLE READ` 只读快照中完成存在性检查与分类，不阻塞任何写者。

@@ -30,6 +30,17 @@ current revision identity against that baseline: any publish after the
 baseline -- even of byte-identical content -- is reported as a conflict,
 because a digest match alone cannot distinguish "unchanged" from
 "re-published since the session was pinned".
+
+Revision reclamation (``POST /gc``) deletes historical revisions, but
+only ones nothing can still reach: the execute path locks every
+requested object row ``FOR UPDATE`` in one ascending-path statement --
+the same global order publishers, session creation and acknowledgements
+use -- and only then classifies revisions inside the held locks.  A
+revision is deleted solely when, at that locked moment, it is not the
+object's current revision and no copy-session manifest entry or target
+baseline references it, so a concurrent PUT, session creation,
+acknowledgement or streaming GET can never lose a revision it is using
+nor be left with a dangling reference.
 """
 from __future__ import annotations
 
@@ -803,3 +814,145 @@ async def apply_copy_entries(
             }
         )
     return applied, conflicts
+
+
+# ---- historical revision reclamation ------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class GcRevision:
+    """A revision older than the GC cutoff, with its retention facts.
+
+    ``retained`` is the disjunction of the three reasons a revision may
+    not be collected: it is the object's current revision, a copy-session
+    manifest pins it, or a target baseline references it.
+    """
+
+    id: int
+    path: str
+    revision_no: int
+    length: int
+    created_at: datetime
+    is_current: bool
+    in_manifest: bool
+    in_baseline: bool
+
+    @property
+    def retained(self) -> bool:
+        return self.is_current or self.in_manifest or self.in_baseline
+
+
+async def lock_existing_objects(
+    conn: asyncpg.Connection, paths: list[str]
+) -> dict[str, asyncpg.Record]:
+    """FOR UPDATE-lock existing object rows in ascending path order.
+
+    Unlike the copy-session helpers this never inserts placeholder rows:
+    reclamation must not create objects.  Rows are locked in one
+    ascending-path statement -- the same global order publishers, session
+    creation (FOR SHARE) and acknowledgements use -- so a GC transaction
+    serialises against all of them without deadlocks.  Anything that
+    could still reference a revision of these paths (a streaming GET's
+    share lock, a session being created, an acknowledgement publishing
+    to a target) either already committed -- and is visible to the
+    classification that follows -- or blocks until this transaction
+    commits.  Returns path -> row (``current_id`` may be NULL for a
+    placeholder left by session creation).
+    """
+    rows = await conn.fetch(
+        """
+        SELECT o.path, o.current_id
+          FROM objects o
+         WHERE o.path = ANY($1::text[])
+         ORDER BY o.path ASC
+         FOR UPDATE OF o
+        """,
+        paths,
+    )
+    return {r["path"]: r for r in rows}
+
+
+async def paths_with_current_revision(
+    conn: asyncpg.Connection, paths: list[str]
+) -> set[str]:
+    """Subset of ``paths`` that exist and have a current revision.
+
+    A bare placeholder row (``current_id`` NULL) does not count: such a
+    path is a 404 for readers, so it is a 404 for reclamation too.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT o.path
+          FROM objects o
+         WHERE o.path = ANY($1::text[])
+           AND o.current_id IS NOT NULL
+        """,
+        paths,
+    )
+    return {r["path"] for r in rows}
+
+
+async def classify_revisions(
+    conn: asyncpg.Connection, paths: list[str], before: datetime
+) -> list[GcRevision]:
+    """Revisions of ``paths`` created strictly before ``before``.
+
+    Every row carries its three retention facts, evaluated in the
+    caller's transaction (for the execute path: under the held FOR
+    UPDATE locks, so the facts cannot go stale before the DELETE).
+    Ordered by ascending path and revision number -- the fixed order the
+    responses are built in.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT r.id, r.object_path AS path, r.revision_no,
+               octet_length(r.content) AS length, r.created_at,
+               (o.current_id = r.id) AS is_current,
+               EXISTS (SELECT 1 FROM copy_session_entries e
+                        WHERE e.revision_id = r.id) AS in_manifest,
+               EXISTS (SELECT 1 FROM copy_session_target_baselines b
+                        WHERE b.revision_id = r.id) AS in_baseline
+          FROM revisions r
+          JOIN objects o ON o.path = r.object_path
+         WHERE r.object_path = ANY($1::text[])
+           AND r.created_at < $2
+         ORDER BY r.object_path ASC, r.revision_no ASC
+        """,
+        paths,
+        before,
+    )
+    return [
+        GcRevision(
+            id=row["id"],
+            path=row["path"],
+            revision_no=row["revision_no"],
+            length=row["length"],
+            created_at=row["created_at"],
+            is_current=row["is_current"],
+            in_manifest=row["in_manifest"],
+            in_baseline=row["in_baseline"],
+        )
+        for row in rows
+    ]
+
+
+async def delete_revisions(
+    conn: asyncpg.Connection, revision_ids: list[int]
+) -> None:
+    """Delete revisions by id, inside the caller's transaction.
+
+    Callers must hold the FOR UPDATE locks on the owning object rows and
+    must have classified under those locks, so every id here is
+    unreferenced (not current, not pinned by a manifest or baseline) and
+    the delete cannot violate the foreign keys from ``objects``,
+    ``copy_session_entries`` or ``copy_session_target_baselines``.  The
+    current revision -- always the highest revision number -- is never
+    deleted, so ``max(revision_no) + 1`` keeps the per-object numbering
+    strictly increasing across collections.
+    """
+    if not revision_ids:
+        return
+    await conn.execute(
+        "DELETE FROM revisions WHERE id = ANY($1::bigint[])",
+        revision_ids,
+    )

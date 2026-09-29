@@ -15,6 +15,12 @@ top: a session pins a manifest of source revisions in one database
 snapshot, serves it in cursor-addressed segments that are byte-identical
 on every pull, and applies each acknowledged segment to the target
 prefix as a single atomic batch.
+
+Historical revision reclamation (``POST /gc``) deletes revisions that
+nothing can reach any more -- never the current revision, never a
+revision pinned by a copy-session manifest or target baseline -- either
+as a read-only preview (``dry_run``) or as one locked, re-validated,
+all-or-nothing transaction.
 """
 from __future__ import annotations
 
@@ -23,13 +29,19 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import db as database
-from .config import COPY_MAX_SEGMENT_SIZE, COPY_SEGMENT_SIZE, DATABASE_URL
+from .config import (
+    COPY_MAX_SEGMENT_SIZE,
+    COPY_SEGMENT_SIZE,
+    DATABASE_URL,
+    GC_MAX_PATHS,
+)
 from .copy_sessions import (
     CopyCursor,
     decode_cursor,
@@ -810,3 +822,176 @@ async def ack_copy_segment(session_id: str, request: Request):
         await database.advance_session(conn, session.id, cur.segment + 1)
         await tx.commit()
         return JSONResponse(result, status_code=200)
+
+
+# ---- historical revision reclamation ------------------------------------------
+
+
+def _parse_iso8601(raw: str) -> datetime | None:
+    """Parse an ISO 8601 timestamp; a naive value is read as UTC."""
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _gc_not_found(missing: list[str]) -> JSONResponse:
+    return JSONResponse(
+        {"detail": "object_not_found", "missing": missing},
+        status_code=404,
+    )
+
+
+def _gc_preview(paths: list[str], before: datetime, classified) -> dict:
+    """Dry-run report: per path, the candidate revisions (with their
+    bytes), the releasable total, and the retained revisions with the
+    reasons they must survive a collection."""
+    per_path: dict[str, dict] = {
+        p: {"candidates": [], "retained": []} for p in paths
+    }
+    for rev in classified:
+        bucket = per_path[rev.path]
+        if rev.retained:
+            reasons = []
+            if rev.is_current:
+                reasons.append("current")
+            if rev.in_manifest:
+                reasons.append("copy_manifest")
+            if rev.in_baseline:
+                reasons.append("target_baseline")
+            bucket["retained"].append(
+                {"revision_no": rev.revision_no, "reasons": reasons}
+            )
+        else:
+            bucket["candidates"].append(
+                {"revision_no": rev.revision_no, "bytes": rev.length}
+            )
+    objects = []
+    total = 0
+    for p in paths:
+        bucket = per_path[p]
+        releasable = sum(c["bytes"] for c in bucket["candidates"])
+        total += releasable
+        objects.append(
+            {
+                "path": p,
+                "candidates": bucket["candidates"],
+                "releasable_bytes": releasable,
+                "retained": bucket["retained"],
+            }
+        )
+    return {
+        "dry_run": True,
+        "before": before.isoformat(),
+        "objects": objects,
+        "total_releasable_bytes": total,
+    }
+
+
+@app.post("/gc")
+async def gc_revisions(request: Request):
+    """Reclaim historical revisions -- or preview the reclamation.
+
+    Only revisions created strictly before ``before`` are considered at
+    all, and a revision is deleted only when nothing can still reach it:
+    the current revision of every object, every revision pinned by a
+    copy-session manifest and every revision referenced by a target
+    baseline are always retained.  ``dry_run`` (default true) reports
+    candidates, releasable bytes and retention reasons from one
+    repeatable-read snapshot without changing anything.  With
+    ``dry_run=false`` the object rows are locked in ascending path order
+    -- the same global order publishers, session creation and
+    acknowledgements use -- the classification is repeated under those
+    locks, and the survivors are deleted in the same transaction, so a
+    concurrent PUT / session / acknowledgement / streaming GET either
+    already committed (and is visible to the re-classification) or waits
+    until this transaction commits; any failure rolls the whole batch
+    back.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _bad_request("request body must be a JSON object")
+
+    raw_paths = body.get("paths")
+    if (
+        not isinstance(raw_paths, list)
+        or not raw_paths
+        or len(raw_paths) > GC_MAX_PATHS
+        or not all(isinstance(p, str) and p for p in raw_paths)
+    ):
+        return _bad_request(
+            f"paths must be a list of 1 to {GC_MAX_PATHS} non-empty paths"
+        )
+
+    before_raw = body.get("before")
+    if not isinstance(before_raw, str):
+        return _bad_request("before must be an ISO 8601 timestamp")
+    before = _parse_iso8601(before_raw)
+    if before is None:
+        return _bad_request("before must be an ISO 8601 timestamp")
+
+    dry_run = body.get("dry_run", True)
+    if not isinstance(dry_run, bool):
+        return _bad_request("dry_run must be a boolean")
+
+    # De-duplicate; every response is ordered by this stable path order.
+    paths = sorted(set(raw_paths))
+    pool = request.app.state.pool
+
+    if dry_run:
+        async with pool.acquire() as conn:
+            async with conn.transaction(
+                isolation="repeatable_read", readonly=True
+            ):
+                # One snapshot for the existence check and the
+                # classification, so the preview is self-consistent.
+                existing = await database.paths_with_current_revision(
+                    conn, paths
+                )
+                missing = [p for p in paths if p not in existing]
+                if missing:
+                    return _gc_not_found(missing)
+                classified = await database.classify_revisions(
+                    conn, paths, before
+                )
+        return _gc_preview(paths, before, classified)
+
+    deleted: list[dict] = []
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Lock first (no placeholder inserts: GC never creates
+            # objects), then re-classify under the held locks and delete
+            # in the same transaction -- any failure rolls the whole
+            # batch back, leaving no partial collection behind.
+            locked = await database.lock_existing_objects(conn, paths)
+            missing = [
+                p
+                for p in paths
+                if p not in locked or locked[p]["current_id"] is None
+            ]
+            if missing:
+                return _gc_not_found(missing)
+            classified = await database.classify_revisions(conn, paths, before)
+            victims = [r for r in classified if not r.retained]
+            await database.delete_revisions(conn, [r.id for r in victims])
+            deleted = [
+                {
+                    "path": r.path,
+                    "revision_no": r.revision_no,
+                    "bytes": r.length,
+                }
+                for r in victims
+            ]
+    return {
+        "dry_run": False,
+        "before": before.isoformat(),
+        "deleted": deleted,
+        "deleted_count": len(deleted),
+        "deleted_bytes": sum(d["bytes"] for d in deleted),
+    }

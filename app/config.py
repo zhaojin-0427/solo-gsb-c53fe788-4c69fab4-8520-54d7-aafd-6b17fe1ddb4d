@@ -11,6 +11,8 @@ CHUNK_SIZE = int(os.environ.get("ORIGIN_CHUNK_SIZE", str(1024 * 1024)))
 # Default / upper bound for entries per copy-session segment.
 COPY_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_SEGMENT_SIZE", "16"))
 COPY_MAX_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_MAX_SEGMENT_SIZE", "1024"))
+# Upper bound for object paths accepted by one revision-GC request.
+GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS objects (
@@ -84,6 +86,11 @@ CREATE TABLE IF NOT EXISTS copy_session_entries (
 CREATE INDEX IF NOT EXISTS copy_session_entries_segment_idx
     ON copy_session_entries (session_id, segment_no, ordinal);
 
+-- Lookups "is this revision still referenced?" run on every GC
+-- classification, so both referencing columns get an index.
+CREATE INDEX IF NOT EXISTS copy_session_entries_revision_idx
+    ON copy_session_entries (revision_id);
+
 -- Revision baseline captured for EVERY target path in the same
 -- transaction (and lock snapshot) as the manifest.  A NULL revision_id
 -- records "the target did not exist when the session was created"; this
@@ -99,6 +106,9 @@ CREATE TABLE IF NOT EXISTS copy_session_target_baselines (
     sha256      text,
     PRIMARY KEY (session_id, target_path)
 );
+
+CREATE INDEX IF NOT EXISTS copy_session_baselines_revision_idx
+    ON copy_session_target_baselines (revision_id);
 
 -- One row per acknowledged segment: the persisted batch result that
 -- makes repeated acknowledgements and replays byte-identical.  Stored
