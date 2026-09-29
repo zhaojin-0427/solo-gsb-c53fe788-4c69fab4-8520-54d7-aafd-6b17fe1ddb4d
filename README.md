@@ -13,6 +13,7 @@
 - `If-Range`（ETag 强比较或 HTTP 日期）失配时忽略 Range，返回完整实体（200）。
 - 每次响应绑定同一修订：流式传输期间事务与行锁保持打开，此时发布新版本**不会混入**内容或元数据。
 - **可恢复复制会话**：`POST /copy-sessions` 在同一数据库快照中锁定源路径集合与全部目标路径，生成按稳定路径与修订序排列、带 SHA-256 内容摘要的清单，并为每个目标路径（含目标尚不存在的状态）保存**修订身份基线**；客户端按游标逐段拉取内容（重复拉取字节、摘要、游标完全一致，即使源对象随后发布新修订），逐段确认时服务锁定目标并与基线比较修订身份——**建档后目标路径的任何发布（哪怕字节与待复制内容完全相同）都判为冲突**，返回 `409`、冲突对象与恢复位置，整批不应用、不推进游标；基线未变时维持原子应用与会话前同内容目标的幂等跳过，重复确认或重放返回同一批次结果。
+- **历史修订回收**：`POST /revision-reclamation` 一次提交 1～100 个对象路径（服务端去重、按路径排序）与 UTC 截止时间 `before`，只回收创建时间**严格早于** `before` 的修订；当前修订以及被任何复制会话**清单**或**目标基线**引用的修订一律保留。`dry_run=true` 返回按路径排序的候选修订号、可释放字节数与被保留修订的原因且不改数据；`dry_run=false` 按固定路径顺序对对象行加 `FOR UPDATE` 锁，在**同一事务内重新判定并删除**，返回实际删除清单与字节数，失败整批回滚；重复执行返回空清单，删除后新发布的修订号继续递增、不复用已删除编号。
 
 ## 快速启动（Docker Compose）
 
@@ -39,6 +40,7 @@ curl http://localhost:8000/healthz
 | `GET` | `/copy-sessions/{id}` | 会话状态：清单摘要、分段进度、恢复位置 |
 | `GET` | `/copy-sessions/{id}/segments?cursor=` | 拉取游标之后的内容分段（无 `cursor` 参数时返回首段）；重复拉取字节、摘要、游标完全一致 |
 | `POST` | `/copy-sessions/{id}/acks` | 按游标确认分段：锁定目标并与建档修订基线比较身份，原子批次应用；建档后任何发布（含同字节重发）返回 `409`，整批不应用、不推进游标；重复确认 / 重放返回同一批次结果 |
+| `POST` | `/revision-reclamation` | 历史修订回收：提交 1～100 个路径（去重）、UTC 截止时间 `before` 与 `dry_run`；预览候选修订/可释放字节/保留原因，或在同一事务内重新判定并删除；任一路径不存在返回 `404` |
 | `GET` | `/healthz` | 健康检查 |
 
 支持的条件头：`If-Match`、`If-None-Match`、`If-Modified-Since`、`If-Unmodified-Since`（PUT/GET/HEAD 均按 §13.2.2 顺序求值）。
@@ -243,6 +245,147 @@ curl -s -X POST http://localhost:8000/copy-sessions -H 'Content-Type: applicatio
        "cursor": "<last_confirmed_cursor>"}' | python3 -m json.tool
 ```
 
+## 历史修订回收（预览 + 执行）
+
+`POST /revision-reclamation` 批量回收对象的历史修订，请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `paths` | string[]（1～100，非空字符串） | 对象路径集合，服务端**去重**后按路径升序处理；重复路径只算一次 |
+| `before` | string（ISO 8601，**必须带时区**） | UTC 截止时间；只考虑 `created_at` **严格早于**该时刻的修订（相等不算） |
+| `dry_run` | boolean | `true` 仅预览不改数据；`false` 在同一事务内重新判定并删除 |
+
+保留规则（在严格早于 `before` 的修订范围内）：
+
+- **当前修订**保留（`reason: "current"`）；
+- 被任何复制会话**清单条目**（`copy_session_entries`）引用的修订保留（`reason: "copy_session_manifest"`）；
+- 被任何复制会话**目标基线**（`copy_session_target_baselines`）引用的修订保留（`reason: "target_baseline"`）；
+- 同一修订同时满足多条时按 `current` → `copy_session_manifest` → `target_baseline` 的固定优先级报告一个原因；
+- 创建时间 ≥ `before` 的修订根本不参与判定，既不进 `candidates` 也不进 `retained`。
+
+任一路径不存在（或只是 `current_id` 为 NULL 的空占位行）时**整次请求返回 `404`**，其它路径也不预览、不删除。
+
+```bash
+# 准备：demo/a.txt 发布 3 个修订，demo/b.txt 发布 2 个修订；
+#       把要回收的旧修订创建时间改到 before 之前（仅演示用）
+curl -s -X PUT --data-binary 'revision-one'          http://localhost:8000/objects/demo/a.txt
+curl -s -X PUT --data-binary 'revision-two-content'  http://localhost:8000/objects/demo/a.txt
+curl -s -X PUT --data-binary 'revision-three-current' http://localhost:8000/objects/demo/a.txt
+curl -s -X PUT --data-binary 'b-rev-one'         http://localhost:8000/objects/demo/b.txt
+curl -s -X PUT --data-binary 'b-rev-two-current' http://localhost:8000/objects/demo/b.txt
+
+# 1. 预览（dry_run=true；重复路径 "demo/a.txt" 被去重，结果按路径排序）
+curl -s -X POST http://localhost:8000/revision-reclamation \
+  -H 'Content-Type: application/json' \
+  -d '{"paths": ["demo/a.txt", "demo/b.txt", "demo/a.txt"],
+       "before": "2026-02-01T00:00:00Z", "dry_run": true}' | python3 -m json.tool
+```
+
+预览响应（`candidates` 与 `retained` 均按修订号升序；当前修订创建时间在 `before` 之后，因此不出现在任何一侧）：
+
+```json
+{
+  "dry_run": true,
+  "before": "2026-02-01T00:00:00+00:00",
+  "paths": [
+    {
+      "path": "demo/a.txt",
+      "reclaimable_bytes": 32,
+      "candidates": [
+        {"revision_no": 1, "sha256": "331ca35e2b6ad67b4cef1843e4542ff8d89a0bcf92536085550a0871dc47d117", "bytes": 12, "created_at": "2026-01-15T00:00:00+00:00"},
+        {"revision_no": 2, "sha256": "b4aa959945c675108a88e3be0d1c3603281e7e534692af5443ad91ece788588d", "bytes": 20, "created_at": "2026-01-15T00:00:00+00:00"}
+      ],
+      "retained": []
+    },
+    {
+      "path": "demo/b.txt",
+      "reclaimable_bytes": 9,
+      "candidates": [
+        {"revision_no": 1, "sha256": "095826513774d1bc3254a79b82504295caeeebdaa47d30dcc2dd8ecaa768cf6a", "bytes": 9, "created_at": "2026-01-15T00:00:00+00:00"}
+      ],
+      "retained": []
+    }
+  ],
+  "total_reclaimable_bytes": 41,
+  "total_candidates": 3
+}
+```
+
+`retained` 中带原因的保留修订示例（该对象的修订 2 被复制会话目标基线引用、修订 3 是当前修订；无引用的旧修订 1 进入 `candidates`）：
+
+```json
+{
+  "path": "demo/tgt.txt",
+  "reclaimable_bytes": 5,
+  "candidates": [
+    {"revision_no": 1, "sha256": "338f7079370d1c2e5420b6c49be4dab13e9f96e6ad99e5fcc83589357050ba95", "bytes": 5, "created_at": "2026-01-15T00:00:00+00:00"}
+  ],
+  "retained": [
+    {"revision_no": 2, "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5", "bytes": 7,  "created_at": "2026-01-15T00:00:00+00:00", "reason": "target_baseline"},
+    {"revision_no": 3, "sha256": "eb46499292ef92870da013bb80cd057a43736325775d17c40f3a8885e878fcd1", "bytes": 15, "created_at": "2026-01-15T00:00:00+00:00", "reason": "current"}
+  ]
+}
+```
+
+```bash
+# 2. 执行（dry_run=false）：按固定路径顺序 FOR UPDATE 锁定对象，
+#    在同一事务内重新判定候选集合并删除；失败整批回滚
+curl -s -X POST http://localhost:8000/revision-reclamation \
+  -H 'Content-Type: application/json' \
+  -d '{"paths": ["demo/a.txt", "demo/b.txt", "demo/a.txt"],
+       "before": "2026-02-01T00:00:00Z", "dry_run": false}' | python3 -m json.tool
+```
+
+```json
+{
+  "dry_run": false,
+  "before": "2026-02-01T00:00:00+00:00",
+  "deleted": [
+    {
+      "path": "demo/a.txt",
+      "deleted": [
+        {"revision_no": 1, "bytes": 12, "created_at": "2026-01-15T00:00:00+00:00"},
+        {"revision_no": 2, "bytes": 20, "created_at": "2026-01-15T00:00:00+00:00"}
+      ]
+    },
+    {
+      "path": "demo/b.txt",
+      "deleted": [
+        {"revision_no": 1, "bytes": 9, "created_at": "2026-01-15T00:00:00+00:00"}
+      ]
+    }
+  ],
+  "deleted_revisions": 3,
+  "reclaimed_bytes": 41
+}
+```
+
+```bash
+# 3. 重复执行：幂等返回每路径空清单、0 字节
+curl -s -X POST http://localhost:8000/revision-reclamation -H 'Content-Type: application/json' \
+  -d '{"paths": ["demo/a.txt", "demo/b.txt"], "before": "2026-02-01T00:00:00Z", "dry_run": false}'
+# -> {"dry_run": false, "before": "...",
+#     "deleted": [{"path": "demo/a.txt", "deleted": []},
+#                 {"path": "demo/b.txt", "deleted": []}],
+#     "deleted_revisions": 0, "reclaimed_bytes": 0}
+
+# 4. 删除后继续发布：修订号只增不复用（这里返回 X-Revision-No: 4，而不是 1）
+curl -i -X PUT --data-binary 'revision-four' http://localhost:8000/objects/demo/a.txt
+
+# 5. 任一路径不存在：整次 404，其它路径也不做任何改动
+curl -i -X POST http://localhost:8000/revision-reclamation -H 'Content-Type: application/json' \
+  -d '{"paths": ["demo/a.txt", "demo/missing.txt"],
+       "before": "2030-01-01T00:00:00Z", "dry_run": true}'
+# HTTP/1.1 404
+# {"detail": "path_not_found", "missing": ["demo/missing.txt"]}
+```
+
+并发保证：回收（预览与执行）都按升序路径对 `objects` 行加 `FOR UPDATE`，与 `PUT`、复制会话建档/确认使用同一全局锁序——
+
+- 与 **`PUT`** 并发：双方在对象行锁上串行；回收事务内的"重新判定"发生在加锁之后，新发布刚成为当前的修订必然保留，旧编号被删除后新修订仍以 `max+1` 接续编号；
+- 与**流式 GET** 并发：GET 在最后一个字节发出前持有 `FOR SHARE`，回收的 `FOR UPDATE` 在其后排队，不会删掉正在流式输出的修订；
+- 与**复制会话建档/确认**并发：清单与基线引用在同一锁快照中可见，被引用的修订不会被删；`copy_session_entries` / `copy_session_target_baselines` 的外键是第二道防线——万一引用漏判，删除直接失败、整批回滚，绝不留下悬空引用。
+
 ## 本地开发
 
 ```bash
@@ -262,6 +405,7 @@ python -m pytest
 - `tests/test_copy_cursor.py`：复制游标与清单摘要的纯逻辑单元测试（编解码往返、防篡改、确定性）。
 - `tests/test_integration.py`：真实 PostgreSQL + 完整 HTTP 服务的端到端测试，覆盖 200/204/206/304/404/412/416、多段 multipart 确定性、`If-Range`、并发"仅创建"只有一个成功、以及流式传输期间发布新版本不混入内容。
 - `tests/test_copy_sessions.py`：复制会话端到端测试，覆盖清单顺序与摘要、分段重复拉取字节一致、源对象发布新修订后仍返回快照内容、原子应用、冲突整批回滚与结构化结果、**建档后同字节重新发布仍判冲突（含已存在目标的同内容新修订、整批回滚、新会话恢复）**、升级前无基线会话返回 `baseline_missing` 不按摘要放行、重放返回同一批次结果、乱序/伪造游标拒绝、跨会话断点续传与冲突恢复、并发确认收敛，以及**确认与目标首次发布在空占位行上的交错：DB 层确定性复现两种先后顺序（PUT 先 -> 409 非 500、修订号不重复；确认先 -> PUT 等待并接续修订号）+ HTTP 屏障压测两者皆不出现 500/重复修订号**。
+- `tests/test_reclamation.py`：历史修订回收端到端测试，覆盖参数校验（1～100 路径、布尔 `dry_run`、带时区的 ISO 8601 `before`、非 JSON）、服务端去重与按路径排序、路径不存在（含 `current_id` NULL 空占位行）整次 404 且不动其它路径、`before` 严格早于的边界、当前修订/清单/基线三类保留原因与优先级、预览不改数据、执行删除清单与字节数、**重复执行空清单 + 删除后修订号继续递增不复用**、与 `PUT` 的 HTTP 屏障压测（被删的恰是旧修订、当前修订永不受损）、回收在流式 GET 的 `FOR SHARE` 后排队（HTTP 背压 + DB 层确定性复现）、与建档/确认并发不产生悬空引用且会话仍可拉取/确认，以及 DB 层交错下锁内重新判定跟随已提交发布、外键兜底阻止删除被引用修订。
 
 ## 设计要点
 
@@ -275,3 +419,4 @@ python -m pytest
 - **确定性游标**：游标 = HMAC-SHA-256 签名的 `(会话, 段号, 清单摘要, 段末路径, 目标前缀, 源集摘要)`，是同一会话状态的纯函数——重发必相同、跨会话/跨清单必失效（`cursor_expired`）；签名密钥存于 `service_meta` 表，重启后游标仍有效。
 - **原子批次确认**：确认在单事务内先用一条纯 `FOR UPDATE`（不连接 `revisions`）按目标路径升序锁定本批**全部** `objects` 行——建档留下的空占位行也在内——再用第二条语句读取当前修订（与建档的 `FOR SHARE`、并发发布及其它会话使用同一全局锁序，无死锁地串行化），逐目标与基线比较修订身份：基线不存在且仍不存在则创建、身份未变且摘要相同则幂等跳过、身份变化（含同字节重发，`reason=target_republished_same_content`）或摘要分歧（`content_diverged`）记为冲突；整批应用 + ack 记录 + 进度推进同事务提交，冲突则整批回滚后单独落库冲突结果。批次结果以**文本**形式存储（保持原始键序），重放与首次响应字节一致；`INSERT ... ON CONFLICT DO NOTHING` 使并发确认收敛到同一条结果。
 - **升级兼容**：表结构由启动时的 `CREATE TABLE IF NOT EXISTS` 自动补齐，旧库重启即有基线表；升级前创建的未完成会话没有基线行，确认未完成段时返回 `409 baseline_missing` 且不推进游标（绝不按摘要放行），重新创建会话取得新基线后继续；已经持久化的历史确认结果仍优先重放，不受影响。
+- **历史修订回收**：`POST /revision-reclamation` 在单事务内先按去重后的升序路径用一条纯 `FOR UPDATE`（不连接 `revisions`，空占位行也锁得住）锁定全部对象行，再在锁内用一条带 `EXISTS` 子查询的快照同时判定每个旧修订的三种引用——`objects.current_id`、`copy_session_entries.revision_id`、`copy_session_target_baselines.revision_id`；只统计 `created_at < before` 的修订，原因按 `current` → `copy_session_manifest` → `target_baseline` 固定优先级报告，所以预览与执行、重复执行之间结果确定。预览与执行都取 `FOR UPDATE`：预览借此成为与并发发布/建档/确认互斥的时间点视图，并像 `PUT` 一样在流式 GET 的 `FOR SHARE` 后排队（GET 最后一个字节发出前不会删掉它正在输出的当前修订）；执行则在**同一把锁、同一事务内重新判定后才 `DELETE`**，任何并发写都无法在判定与删除之间把被删修订重新变成当前或补上引用。`copy_session_entries` / `copy_session_target_baselines` 指向 `revisions` 的外键不可延迟，是第二道防线：漏判引用时删除语句直接抛外键违约，整个批次回滚而不留悬空引用。删除不改变修订号分配——`revision_no` 恒为该对象 `max(revision_no)+1`，故回收后发布的修订号继续递增、不复用已删除编号；重复执行在锁内重新判定得到空候选集合，返回空清单与 0 字节。

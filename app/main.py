@@ -23,6 +23,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, Response
@@ -59,8 +60,18 @@ from .ranges import (
 
 DEFAULT_MEDIA_TYPE = "application/octet-stream"
 
+# Bounds for a single revision-reclamation request.
+RECLAIM_MAX_PATHS = 100
+
 # HTTP status replayed alongside a stored copy-session batch result.
 ACK_STATUS_CODES = {"applied": 200, "conflict": 409}
+
+
+def _utc_iso(dt: datetime) -> str:
+    """Render a timestamp as a second-precision UTC ISO 8601 instant."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 @dataclass(slots=True)
@@ -810,3 +821,194 @@ async def ack_copy_segment(session_id: str, request: Request):
         await database.advance_session(conn, session.id, cur.segment + 1)
         await tx.commit()
         return JSONResponse(result, status_code=200)
+
+
+# ---- historical revision reclamation -----------------------------------------
+
+
+def _parse_before(value) -> datetime | None:
+    """Parse the UTC cutoff (ISO 8601); naive input is rejected.
+
+    Returning ``None`` means the caller should answer 400: the cutoff
+    must be an explicit instant, so a timestamp without timezone offset
+    is ambiguous and refused rather than silently assumed to be UTC.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
+
+
+def _reclaim_revision_entry(row) -> dict:
+    return {
+        "revision_no": row["revision_no"],
+        "sha256": row["sha256"],
+        "bytes": row["length"],
+        "created_at": _utc_iso(row["created_at"]),
+    }
+
+
+@app.post("/revision-reclamation")
+async def reclaim_revisions(request: Request):
+    """Reclaim (or preview) historical revisions of up to 100 objects.
+
+    Only revisions whose ``created_at`` is strictly older than ``before``
+    are considered.  Of those, the current revision of every object and
+    every revision pinned by a copy-session manifest or a target baseline
+    is retained.  Everything else is reclaimable.
+
+    ``dry_run=true`` takes FOR UPDATE locks on the object rows in their
+    fixed (sorted) path order and reports, per path and sorted by path:
+    the candidate revision numbers with their reclaimable bytes and the
+    retained revisions with their reasons.  The exclusive lock makes the
+    preview a consistent point-in-time view (and queues it behind an
+    in-flight streaming GET); nothing is deleted.
+
+    ``dry_run=false`` keeps those same FOR UPDATE locks and *re-judges
+    inside the same transaction* which revisions are still unreferenced
+    before deleting them, so a reclaim racing a PUT, a session
+    creation/ack or a streaming GET cannot delete an in-use revision or
+    strand a reference.  The delete and its verdict commit as one
+    transaction; any failure rolls the whole batch back.  A repeated
+    execution finds nothing left and reports an empty list; subsequent
+    publishes keep advancing the revision sequence (deleted numbers are
+    never reused).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _bad_request("request body must be a JSON object")
+
+    raw_paths = body.get("paths")
+    if not isinstance(raw_paths, list) or not (1 <= len(raw_paths) <= RECLAIM_MAX_PATHS):
+        return _bad_request(
+            f"paths must be a non-empty list of at most {RECLAIM_MAX_PATHS} paths"
+        )
+    if not all(isinstance(p, str) and p for p in raw_paths):
+        return _bad_request("paths must be non-empty strings")
+    # Server-side de-duplication; locking and reporting use this fixed
+    # ascending path order, which is the global lock order every other
+    # writer uses.
+    paths = sorted(set(raw_paths))
+
+    before = _parse_before(body.get("before"))
+    if before is None:
+        return _bad_request(
+            "before must be an ISO 8601 UTC timestamp with timezone offset"
+        )
+
+    dry_run = body.get("dry_run")
+    if not isinstance(dry_run, bool):
+        return _bad_request("dry_run must be a boolean")
+
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Lock first, in the fixed path order; a missing path aborts
+            # the WHOLE request with 404 (nothing is previewed or
+            # deleted for any path), as does an empty placeholder row.
+            current_ids = await database.lock_reclaim_paths(conn, paths)
+            missing = [p for p in paths if p not in current_ids]
+            empty = [p for p in paths if current_ids.get(p, False) is None]
+            if missing or empty:
+                return JSONResponse(
+                    {
+                        "detail": "path_not_found",
+                        "missing": missing + empty,
+                    },
+                    status_code=404,
+                )
+
+            by_path = await database.collect_reclaimable(conn, paths, before)
+
+            results = []
+            candidate_ids: list[int] = []
+            total_bytes = 0
+            for p in paths:
+                candidates = []
+                retained = []
+                reclaimable_bytes = 0
+                for row in by_path[p]:
+                    entry = _reclaim_revision_entry(row)
+                    reason = database.reclaim_reason(row)
+                    if reason is None:
+                        candidates.append(entry)
+                        candidate_ids.append(row["id"])
+                        reclaimable_bytes += row["length"]
+                    else:
+                        retained.append({**entry, "reason": reason})
+                total_bytes += reclaimable_bytes
+                results.append(
+                    {
+                        "path": p,
+                        "reclaimable_bytes": reclaimable_bytes,
+                        "candidates": candidates,
+                        "retained": retained,
+                    }
+                )
+
+            if dry_run:
+                return {
+                    "dry_run": True,
+                    "before": _utc_iso(before),
+                    "paths": results,
+                    "total_reclaimable_bytes": total_bytes,
+                    "total_candidates": len(candidate_ids),
+                }
+
+            # Re-judge under the FOR UPDATE locks and delete in one
+            # transaction: collect_reclaimable ran after every object row
+            # was locked FOR UPDATE, so no concurrent publisher/session
+            # could have changed a current pointer or added a reference;
+            # delete_revisions still lists only rows the snapshot proved
+            # unreferenced, and the manifest/baseline foreign keys would
+            # abort (rolling back the whole batch) if that were ever not
+            # true.
+            deleted_rows = await database.delete_revisions(conn, candidate_ids)
+            if len(deleted_rows) != len(candidate_ids):
+                # Cannot happen while the object locks are held: a row
+                # judged reclaimable cannot vanish or be referenced
+                # concurrently.  Refuse a partial outcome rather than
+                # report one; the transaction rolls back on exception.
+                raise RuntimeError("reclaim set changed during deletion")
+
+            deleted_by_path: dict[str, list[dict]] = {p: [] for p in paths}
+            deleted_bytes = 0
+            for row in deleted_rows:
+                deleted_by_path[row["object_path"]].append(
+                    {
+                        "revision_no": row["revision_no"],
+                        "bytes": row["length"],
+                        "created_at": _utc_iso(row["created_at"]),
+                    }
+                )
+                deleted_bytes += row["length"]
+            # Every requested path is reported in the fixed order; a path
+            # with nothing to delete simply carries an empty "deleted"
+            # list (which is all a repeated execution ever returns).
+            deleted = [
+                {
+                    "path": p,
+                    "deleted": sorted(
+                        deleted_by_path[p], key=lambda e: e["revision_no"]
+                    ),
+                }
+                for p in paths
+            ]
+            return {
+                "dry_run": False,
+                "before": _utc_iso(before),
+                "deleted": deleted,
+                "deleted_revisions": len(deleted_rows),
+                "reclaimed_bytes": deleted_bytes,
+            }

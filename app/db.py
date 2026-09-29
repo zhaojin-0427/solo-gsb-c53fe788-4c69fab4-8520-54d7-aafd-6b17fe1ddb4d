@@ -30,6 +30,14 @@ current revision identity against that baseline: any publish after the
 baseline -- even of byte-identical content -- is reported as a conflict,
 because a digest match alone cannot distinguish "unchanged" from
 "re-published since the session was pinned".
+
+Historical revision reclamation (``/revision-reclamation``) reuses the
+same lock-order discipline: every named object row is locked FOR UPDATE
+in ascending path order (for both the dry-run preview and the execution)
+before any revision is examined or deleted, so a reclaim running
+concurrently with a PUT, a copy-session creation/ack or a streaming GET
+can neither delete an in-use revision nor leave a dangling manifest or
+baseline reference.
 """
 from __future__ import annotations
 
@@ -803,3 +811,153 @@ async def apply_copy_entries(
             }
         )
     return applied, conflicts
+
+
+# ---- historical revision reclamation -----------------------------------------
+
+# Retention reason codes, in reporting priority.  A revision can be held
+# by several references at once; the first matching reason in this order
+# is the one reported, so a dry run is deterministic across runs.
+RECLAIM_REASON_CURRENT = "current"
+RECLAIM_REASON_MANIFEST = "copy_session_manifest"
+RECLAIM_REASON_BASELINE = "target_baseline"
+RECLAIM_REASON_PRIORITY = (
+    RECLAIM_REASON_CURRENT,
+    RECLAIM_REASON_MANIFEST,
+    RECLAIM_REASON_BASELINE,
+)
+
+
+async def lock_reclaim_paths(
+    conn: asyncpg.Connection, paths: list[str]
+) -> dict[str, int | None]:
+    """Lock the named object rows FOR UPDATE in ascending path order;
+    return their current revision ids.
+
+    One plain statement without a join to ``revisions`` -- mirroring the
+    publish / acknowledge path -- so every existing row is locked even
+    when ``current_id`` is NULL (an empty placeholder).  Callers pass the
+    paths already sorted and de-duplicated: ascending path order is the
+    same global order every other writer uses, so a reclaim cannot
+    deadlock against concurrent PUTs, session creations (FOR SHARE) or
+    segment acknowledgements (FOR UPDATE).
+
+    The lock is always ``FOR UPDATE`` -- even for a dry run -- for two
+    reasons.  First, it blocks behind a streaming GET, whose ``FOR
+    SHARE`` is held until the last byte: deleting the current revision
+    while its bytes are being streamed out of the ``revisions`` row would
+    break the in-flight response.  Second, it makes the preview a stable
+    point-in-time view: a concurrent publisher/session writer cannot
+    move a current pointer or add a reference between the lock and the
+    snapshot, so the reported candidates and retention reasons cannot go
+    stale before the client reads them.  Dry runs still perform no
+    writes.
+
+    The returned map contains exactly the paths that exist as object
+    rows, each mapped to its current revision id (``None`` for an empty
+    placeholder).  Missing paths are simply absent from the map.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT o.path, o.current_id
+          FROM objects o
+         WHERE o.path = ANY($1::text[])
+         ORDER BY o.path ASC
+         FOR UPDATE OF o
+        """,
+        paths,
+    )
+    return {r["path"]: r["current_id"] for r in rows}
+
+
+async def collect_reclaimable(
+    conn: asyncpg.Connection, paths: list[str], before: datetime
+) -> dict[str, list[asyncpg.Record]]:
+    """Snapshot the named objects' revisions older than ``before``.
+
+    Every returned row carries the revision's identity, size and creation
+    time plus three booleans answering "is anything still holding it?":
+
+    * ``is_current``  -- the object row's current revision;
+    * ``in_manifest`` -- pinned by a copy-session manifest entry;
+    * ``in_baseline`` -- pinned as a target revision baseline.
+
+    All three reads happen after :func:`lock_reclaim_paths` took the
+    object-row FOR UPDATE locks for every path.  No publisher, session
+    creator or ack can move a current pointer, insert a manifest
+    reference or change a baseline between this read and the delete:
+    the re-judgement and the deletion are one serialised critical
+    section.
+
+    Revisions created at or after ``before`` are excluded entirely --
+    strictly older revisions only, regardless of references.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT r.id, r.object_path, r.revision_no, r.sha256,
+               octet_length(r.content) AS length, r.created_at,
+               (r.id = o.current_id) AS is_current,
+               EXISTS (
+                   SELECT 1 FROM copy_session_entries e
+                    WHERE e.revision_id = r.id
+               ) AS in_manifest,
+               EXISTS (
+                   SELECT 1 FROM copy_session_target_baselines b
+                    WHERE b.revision_id = r.id
+               ) AS in_baseline
+          FROM revisions r
+          JOIN objects o ON o.path = r.object_path
+         WHERE r.object_path = ANY($1::text[])
+           AND r.created_at < $2
+         ORDER BY r.object_path ASC, r.revision_no ASC
+        """,
+        paths,
+        before,
+    )
+    by_path: dict[str, list[asyncpg.Record]] = {p: [] for p in paths}
+    for row in rows:
+        by_path[row["object_path"]].append(row)
+    return by_path
+
+
+def reclaim_reason(row: asyncpg.Record) -> str | None:
+    """First retention reason that applies to a collected revision row
+    (priority order), or ``None`` when the revision is reclaimable."""
+    flags = {
+        RECLAIM_REASON_CURRENT: row["is_current"],
+        RECLAIM_REASON_MANIFEST: row["in_manifest"],
+        RECLAIM_REASON_BASELINE: row["in_baseline"],
+    }
+    for reason in RECLAIM_REASON_PRIORITY:
+        if flags[reason]:
+            return reason
+    return None
+
+
+async def delete_revisions(
+    conn: asyncpg.Connection, revision_ids: list[int]
+) -> list[asyncpg.Record]:
+    """Delete the given revision rows, returning id/path/no/size of each.
+
+    Callers must already hold FOR UPDATE locks on the parent object rows
+    and have re-checked that none of the ids is current or referenced by
+    a manifest/baseline.  The non-deferred foreign keys from
+    ``copy_session_entries`` and ``copy_session_target_baselines`` are a
+    second line of defence: a reference that somehow slipped past the
+    check aborts the statement so the surrounding transaction rolls the
+    whole batch back instead of leaving a dangling reference.
+
+    The deletion itself cannot renumber anything: ``revision_no`` is
+    per-object ``max + 1`` and never reuses deleted numbers.
+    """
+    if not revision_ids:
+        return []
+    return await conn.fetch(
+        """
+        DELETE FROM revisions
+         WHERE id = ANY($1::bigint[])
+        RETURNING id, object_path, revision_no,
+                  octet_length(content) AS length, created_at
+        """,
+        revision_ids,
+    )
